@@ -154,97 +154,133 @@ void SimpleTurtle::sensorStateCallback(const kobuki_msgs::SensorState::ConstPtr&
     // LOG YOUR ODOMETRY DATA
 }
 
-double get_probability_of_cell_occupied(float dist_pixel, float dist_laser)
+double SimpleTurtle::get_probability_of_cell_occupied(float dist_pixel, float dist_laser)
 {
-  double laser_precision = 3.0f;
-
   double dist = dist_laser - dist_pixel;
 
   // in front of the obstacle
-  if (dist > laser_precision)
-    return 0.2f;
+  if (dist > laser_precision_)
+    return p_free_;
 
   // inside the obstacle
-  if (abs(dist) <= laser_precision)
-    return 0.8f;
+  if (abs(dist) <= laser_precision_)
+    return p_occupied_;
 
   // behind the obstacle
-  return 0.5f;
+  return p_unknown_;
 }
 
 // PointCloud
 void SimpleTurtle::laserScanCallback(const sensor_msgs::LaserScan::ConstPtr& msg)
 {
-    ROS_INFO("laser scan");
+  ROS_INFO("laser scan");
 
-    double l0 = 0.0f;
+  if (keep_logging_ == false)
+  {
+    std::cout << "     - SKIP" << std::endl;
+    return;
+  }
 
-    int mapX = occupancy_grid_map_.getSizeX();
-    int mapY = occupancy_grid_map_.getSizeY();
+  double l0 = 0.0f;
 
-    // quaternion to YAW
-    geometry_msgs::Quaternion q = pose_.orientation;
-    double angle_robot = atan2(2.0*(q.x*q.y + q.w*q.z), q.w*q.w + q.x*q.x - q.y*q.y - q.z*q.z);
+  // map parameters
+  int mapX = occupancy_grid_map_.getSizeX();
+  int mapY = occupancy_grid_map_.getSizeY();
+  double map_radius = sqrt(mapX * mapX + mapY * mapY);
 
-    double map_radius = sqrt(mapX * mapX + mapY * mapY);
+  // quaternion to YAW
+  geometry_msgs::Pose robot_pose = pose_;
+  geometry_msgs::Quaternion q = robot_pose.orientation;
+  double robot_yaw = atan2(2.0*(q.x*q.y + q.w*q.z), q.w*q.w + q.x*q.x - q.y*q.y - q.z*q.z);
 
-    // get ranges in [cellsize]
-    float range_min = msg->range_min / occupancy_grid_map_.getResolution();
-    float range_max = msg->range_max / occupancy_grid_map_.getResolution();
+  // get ranges in [cellsize]
+  float range_min = msg->range_min / occupancy_grid_map_.getResolution();
+  float range_max = msg->range_max / occupancy_grid_map_.getResolution();
 
-    // for all laser measurements
-    for (int i = 0; i < msg->ranges.size(); i++)
+  // for all laser measurements
+  for (int i = 0; i < msg->ranges.size(); i++)
+  {
+    // laser range in [cellsize] - valid
+    float range = msg->ranges[i] / occupancy_grid_map_.getResolution();
+    if (range < range_min || range > range_max)
+      continue; // invalid laser data
+    
+    double angle_laser = msg->angle_min + msg->angle_increment * i;
+    double angle = robot_yaw + angle_laser;
+
+    // Bresenham algorithm copied from https://de.wikipedia.org/wiki/Bresenham-Algorithmus (21.01.2021)
+    int x0, y0;
+    occupancy_grid_map_.worldToMap(robot_pose.position.x, robot_pose.position.y, x0, y0);
+    int x_init = x0, y_init = y0;
+
+    int x1 = x0 + map_radius * cos(angle);
+    int y1 = x0 + map_radius * sin(angle);
+    
+    int dx =  abs(x1-x0), sx = x0<x1 ? 1 : -1;
+    int dy = -abs(y1-y0), sy = y0<y1 ? 1 : -1;
+    int err = dx+dy, e2; /* error value e_xy */
+    
+    float d = 0.0f;
+    while (1)
     {
-      double angle_laser = msg->angle_min + msg->angle_increment * i;
-      double angle = angle_robot + angle_laser;
-
-
-      // Bresenham algorithm copied from https://de.wikipedia.org/wiki/Bresenham-Algorithmus (21.01.2021)
-      int x0, y0;
-      occupancy_grid_map_.worldToMap(pose_.position.x, pose_.position.y, x0, y0);
-      int x_init = x0, y_init = y0;
-
-      int x1 = x0 + map_radius * cos(angle);
-      int y1 = x0 + map_radius * sin(angle);
+      // break if point is outside of map
+      if (x0 < 0 || y0 < 0 || x0 >= mapX || y0 >= mapY)
+        break;
       
-      int dx =  abs(x1-x0), sx = x0<x1 ? 1 : -1;
-      int dy = -abs(y1-y0), sy = y0<y1 ? 1 : -1;
-      int err = dx+dy, e2; /* error value e_xy */
+      // valid sensor data
+      d = sqrt(pow(x_init - x0, 2) + pow(y_init - y0, 2));
+      //std::cout << " " << d << " " << range << " " << (d / range) << " " << (inverse_sensor_model(d / range) - l0) << std::endl;
+      double probability_of_cell_occupied = get_probability_of_cell_occupied(d, range);
+      double inverse_sensor_model = log(probability_of_cell_occupied / (1 - probability_of_cell_occupied));
+      double new_value = occupancy_grid_map_.getCell(x0, y0) + inverse_sensor_model - l0;
+      occupancy_grid_map_.updateCell(x0, y0, new_value);
 
-      // laser range in [cellsize]
-      float range = msg->ranges[i] / occupancy_grid_map_.getResolution();
-      float d = 0.0f;
-
-      //std::cout << "angle " << angle << " " << range << " " << range_min << " " << range_max << std::endl;
-
-      while (1)
+      // update hits / interceptions
+      if (keep_logging_)
       {
-        // break if point is outside of map
-        if (x0 < 0 || y0 < 0 || x0 >= mapX || y0 >= mapY)
-          break;
-        
-        if (range >= range_min && range <= range_max)
-        {
-          // valid sensor data
-          d = sqrt(pow(x_init - x0, 2) + pow(y_init - y0, 2));
-          //std::cout << " " << d << " " << range << " " << (d / range) << " " << (inverse_sensor_model(d / range) - l0) << std::endl;
-          double probability_of_cell_occupied = get_probability_of_cell_occupied(d, range);
-          double inverse_sensor_model = log(probability_of_cell_occupied / (1 - probability_of_cell_occupied));
-          double new_value = occupancy_grid_map_.getCell(x0, y0) + inverse_sensor_model - l0;
-          occupancy_grid_map_.updateCell(x0, y0, new_value);
-        }
-        else
-        {
-          // invalid data ... skip it
-          break;
-        }
+        if (probability_of_cell_occupied >= 0.6f) // hit
+          hits_[y0][x0]++;
+        else if (probability_of_cell_occupied <= 0.4f) // interception
+          interceptions_[y0][x0]++;
+      }
 
-        if (x0==x1 && y0==y1) break;
-        e2 = 2*err;
-        if (e2 > dy) { err += dy; x0 += sx; } /* e_xy+e_x > 0 */
-        if (e2 < dx) { err += dx; y0 += sy; } /* e_xy+e_y < 0 */
+      if (x0==x1 && y0==y1) break;
+      e2 = 2*err;
+      if (e2 > dy) { err += dy; x0 += sx; } /* e_xy+e_x > 0 */
+      if (e2 < dx) { err += dx; y0 += sy; } /* e_xy+e_y < 0 */
+    }
+  }
+
+  number_of_measurements_++;
+
+  // Task 2
+  if (button_0_pressed_ && keep_logging_)
+  {
+    keep_logging_ = false;
+    std::cout << "OPTIMIZZZZZE" << std::endl;
+    for (int y = 0; y < mapY; y++)
+    {
+      for (int x = 0; x < mapX; x++)
+      {
+        int sum = hits_[y][x] + interceptions_[y][x];
+        if (sum == 0)
+          continue;
+        
+        double P_hit = (double)hits_[y][x] / sum;
+
+        double P_interception = 1 - P_hit;
+
+        double p_cell = pow(p_ratio_, P_hit * number_of_measurements_) * pow(p_ratio_inv_, P_interception * number_of_measurements_);
+
+        // flip cells
+        if (p_cell >= p_occupied_)
+          occupancy_grid_map_.updateCell(x, y, 10);
+        else
+          occupancy_grid_map_.updateCell(x, y, -10);
       }
     }
+    std::cout << "DOOOOOOOOOONE" << std::endl;
+  }
 }
 
 // Robot Pose in World
